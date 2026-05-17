@@ -1,0 +1,47 @@
+# Copier ce fichier en terraform.tfvars et adapter les valeurs
+# cp terraform.tfvars.example terraform.tfvars
+
+# ─── Connexion Proxmox ────────────────────────────────────────────────────────
+proxmox_endpoint  = "https://192.168.1.10:8006"
+# Créer via : Datacenter → Permissions → API Tokens
+proxmox_api_token = "terraform@pam!qemu=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+proxmox_insecure  = true          # mettre false si vous avez un vrai certificat TLS
+proxmox_ssh_user  = "root"
+
+# ─── VM ───────────────────────────────────────────────────────────────────────
+vm_id        = 100
+vm_name      = "my-vm"
+node_name    = "pve"
+clone_vm_id  = 9000              # VMID du template créé via pve-template/create-template.sh
+
+cpu_cores    = 2
+memory_mb    = 2048              # 2 GiB
+disk_size_gb = 20
+
+# ─── Stockage ─────────────────────────────────────────────────────────────────
+# Vérifier via : Datacenter → Storage
+storage_pool           = "local-lvm"   # LVM-Thin recommandé pour les disques VMs
+cloudinit_storage_pool = "local"       # doit avoir "Snippets" activé dans les Content types
+
+# ─── Réseau ───────────────────────────────────────────────────────────────────
+network_bridge = "vmbr0"
+ip_address     = "192.168.1.100/24"
+gateway        = "192.168.1.1"
+dns_servers    = ["192.168.1.1", "1.1.1.1"]
+
+# ─── SSH ──────────────────────────────────────────────────────────────────────
+ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... votre-clé-publique"
+vm_user        = "ubuntu"
+
+# ─── Partitionnement LVM ──────────────────────────────────────────────────────
+# Le disque virtio-scsi est exposé comme /dev/sda dans les VMs
+# (disque 20G → 1G BIOS boot + 1G /boot + ~18G LVM)
+lvm_disk    = "/dev/sda"
+lvm_vg_name = "system"
+lvm_root_gb   = 8
+lvm_home_gb   = 2
+lvm_var_gb    = 4
+lvm_varlog_gb = 2
+lvm_varlib_gb = 6
+lvm_swap_gb   = 2
+# Total LVM : 24G / ~18G → ajuster selon disk_size_gb
