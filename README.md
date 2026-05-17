@@ -1,7 +1,11 @@
-# Terraform – Cluster Kubernetes sur Proxmox VE 9.x
+# terraform-proxmox-qemu
 
-Provisionnement d'un cluster Kubernetes (contrôleurs + workers) via Terraform
-et le provider [bpg/proxmox](https://github.com/bpg/terraform-provider-proxmox).
+Module Terraform pour créer une VM QEMU sur Proxmox VE via le provider [bpg/proxmox](https://github.com/bpg/terraform-provider-proxmox).
+
+Fonctionnalités incluses :
+- Clonage depuis un template cloud image
+- Injection cloud-init (utilisateur, clé SSH, durcissement SSH)
+- Partitionnement LVM au premier boot (layout `/`, `/home`, `/var`, `/var/log`, `/var/lib`, swap)
 
 ## Prérequis
 
@@ -13,160 +17,158 @@ et le provider [bpg/proxmox](https://github.com/bpg/terraform-provider-proxmox).
 
 ---
 
-## Structure du projet
+## 1. Préparer le template Proxmox
 
-```
-terraform-proxmox-k8s/
-├── versions.tf               # Contraintes de version du provider
-├── provider.tf               # Configuration du provider Proxmox
-├── variables.tf              # Déclarations de toutes les variables
-├── main.tf                   # Instanciation des modules (controllers + workers)
-├── outputs.tf                # Sorties (IPs, noms, SSH)
-├── terraform.tfvars.example  # Exemple de configuration (à copier)
-└── modules/
-    └── vm/
-        ├── main.tf           # Ressource proxmox_virtual_environment_vm
-        ├── variables.tf      # Variables du module
-        └── outputs.tf        # Sorties du module
-```
-
----
-
-## 1. Préparer le template Proxmox (cloud-init)
-
-Sur votre hôte Proxmox, exécuter **une seule fois** :
+Sur l'hôte Proxmox, exécuter **une seule fois** :
 
 ```bash
-# Télécharger l'image Ubuntu 24.04 LTS (Noble) cloud
-wget -q https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
-  -O /var/lib/vz/images/noble-server-cloudimg-amd64.img
+cd pve-template/
+./create-template.sh [VMID] [STORAGE] [DISK_SIZE_GB]
 
-# Créer la VM template (VMID 9000)
-qm create 9000 --name "ubuntu-2404-template" --memory 2048 --cores 2 \
-  --net0 virtio,bridge=vmbr0 --ostype l26 --machine q35
-
-# Importer le disque cloud
-qm importdisk 9000 /var/lib/vz/images/noble-server-cloudimg-amd64.img local-lvm
-
-# Configurer le disque et le boot
-qm set 9000 --virtio0 local-lvm:vm-9000-disk-0,discard=on,iothread=1
-qm set 9000 --boot order=virtio0
-qm set 9000 --ide2 local:cloudinit
-qm set 9000 --serial0 socket --vga serial0
-
-# Activer l'agent QEMU (requis par le provider bpg)
-qm set 9000 --agent enabled=1
-
-# Convertir en template
-qm template 9000
+# Exemple :
+./create-template.sh 9000 local-lvm 32
 ```
 
-> **Pré-requis agent QEMU** : l'image cloud Ubuntu inclut `qemu-guest-agent` par défaut.
+Le script télécharge une image Ubuntu 24.04 LTS, y préinstalle `qemu-guest-agent`, `lvm2`, `parted` et le script de partitionnement, puis convertit la VM en template.
 
 ---
 
 ## 2. Créer un token API Proxmox
 
-Dans l'UI Proxmox : **Datacenter → Permissions → API Tokens → Add**
+Dans l'UI : **Datacenter → Permissions → API Tokens → Add**
 
-Ou en ligne de commande :
+Ou en ligne de commande sur l'hôte Proxmox :
 
 ```bash
-# Créer l'utilisateur terraform (optionnel si on utilise root@pam)
 pveum user add terraform@pam --comment "Terraform provisioning"
-
-# Créer le token
-pveum user token add terraform@pam k8s --privsep 0
-
-# Attribuer les permissions nécessaires
+pveum user token add terraform@pam qemu --privsep 0
 pveum acl modify / -user terraform@pam -role Administrator
 ```
 
+Le token est au format `terraform@pam!qemu=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+
 ---
 
-## 3. Configurer Terraform
+## 3. Utilisation
 
-```bash
-# Cloner / copier ce répertoire
-cd terraform-proxmox-k8s
+### En tant que module
 
-# Copier et éditer les variables
-cp terraform.tfvars.example terraform.tfvars
-$EDITOR terraform.tfvars
+```hcl
+module "vm" {
+  source = "github.com/Ramiyoung/terraform-proxmox-qemu"
+
+  # Connexion Proxmox
+  proxmox_endpoint  = "https://192.168.1.10:8006"
+  proxmox_api_token = "terraform@pam!qemu=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  proxmox_insecure  = true
+  proxmox_ssh_user  = "root"
+
+  # VM
+  vm_id        = 100
+  vm_name      = "my-vm"
+  node_name    = "pve"
+  clone_vm_id  = 9000
+
+  cpu_cores    = 2
+  memory_mb    = 2048
+  disk_size_gb = 20
+
+  # Réseau
+  ip_address = "192.168.1.100/24"
+  gateway    = "192.168.1.1"
+
+  # Accès
+  ssh_public_key = "ssh-ed25519 AAAAC3Nz..."
+  vm_user        = "ubuntu"
+
+  # LVM (optionnel — valeurs par défaut raisonnables)
+  lvm_disk      = "/dev/sda"
+  lvm_root_gb   = 8
+  lvm_varlib_gb = 6
+}
+
+output "ssh" {
+  value = "ssh ${module.vm.vm_name}@${module.vm.ip_address}"
+}
 ```
 
-Variables clés à adapter :
-
-| Variable | Description |
-|---|---|
-| `proxmox_endpoint` | URL de votre Proxmox (ex: `https://192.168.1.10:8006`) |
-| `proxmox_api_token` | Token au format `user@realm!id=uuid` |
-| `proxmox_node` | Nom du nœud Proxmox (visible dans l'UI) |
-| `ssh_public_key` | Votre clé publique SSH |
-| `vm_template_id` | VMID du template créé à l'étape 1 (défaut: 9000) |
-
----
-
-## 4. Déployer
+### En standalone (apply direct)
 
 ```bash
+cp terraform.tfvars.example terraform.tfvars
+$EDITOR terraform.tfvars    # renseigner endpoint, token, ssh_public_key, ip…
+
 terraform init
 terraform validate
 terraform plan
 terraform apply
 ```
 
-Après `apply`, les IPs et commandes SSH sont affichées dans les outputs :
+---
 
-```
-outputs:
-  controllers = [{ name = "k8s-controller-01", ip_address = "192.168.1.110/24", vm_id = 200 }]
-  workers     = [{ name = "k8s-worker-01", ... }, { name = "k8s-worker-02", ... }]
-  ssh_connection_examples = [
-    "ssh ubuntu@192.168.1.110  # k8s-controller-01",
-    "ssh ubuntu@192.168.1.120  # k8s-worker-01",
-    ...
-  ]
-```
+## Variables
+
+### Connexion Proxmox
+
+| Variable | Type | Défaut | Description |
+|---|---|---|---|
+| `proxmox_endpoint` | string | — | URL de l'API Proxmox (ex: `https://192.168.1.10:8006`) |
+| `proxmox_api_token` | string | — | Token API au format `user@realm!id=uuid` |
+| `proxmox_insecure` | bool | `true` | Désactiver la vérification TLS |
+| `proxmox_ssh_user` | string | `"root"` | Utilisateur SSH pour l'upload des snippets cloud-init |
+
+### VM
+
+| Variable | Type | Défaut | Description |
+|---|---|---|---|
+| `vm_id` | number | — | VMID unique dans Proxmox |
+| `vm_name` | string | — | Nom de la VM |
+| `vm_description` | string | `""` | Description affichée dans l'UI |
+| `node_name` | string | — | Nœud Proxmox cible |
+| `clone_vm_id` | number | — | VMID du template à cloner |
+| `cpu_cores` | number | — | Nombre de vCPU |
+| `cpu_type` | string | `"host"` | Type CPU exposé à la VM |
+| `memory_mb` | number | — | RAM en MiB |
+| `disk_size_gb` | number | — | Taille du disque OS en GiB |
+| `storage_pool` | string | `"local-lvm"` | Datastore pour le disque |
+| `cloudinit_storage_pool` | string | `"local"` | Datastore pour les snippets cloud-init |
+| `network_bridge` | string | `"vmbr0"` | Bridge réseau Proxmox |
+| `ip_address` | string | — | IP statique avec CIDR (ex: `192.168.1.10/24`) |
+| `gateway` | string | — | Passerelle |
+| `dns_servers` | list(string) | `["1.1.1.1", "8.8.8.8"]` | Serveurs DNS |
+| `ssh_public_key` | string | — | Clé publique SSH injectée via cloud-init |
+| `vm_user` | string | `"ubuntu"` | Utilisateur créé par cloud-init |
+| `tags` | list(string) | `[]` | Tags Proxmox |
+| `start_on_boot` | bool | `true` | Démarrage automatique avec l'hôte |
+| `vm_state` | string | `"running"` | État après provisionnement |
+
+### Partitionnement LVM
+
+| Variable | Défaut | Description |
+|---|---|---|
+| `lvm_disk` | `"/dev/sda"` | Périphérique cible (virtio-scsi → `/dev/sda`, virtio-blk → `/dev/vda`) |
+| `lvm_vg_name` | `"system"` | Nom du Volume Group |
+| `lvm_root_gb` | `8` | Taille du LV `/` |
+| `lvm_home_gb` | `4` | Taille du LV `/home` |
+| `lvm_var_gb` | `4` | Taille du LV `/var` |
+| `lvm_varlog_gb` | `2` | Taille du LV `/var/log` |
+| `lvm_varlib_gb` | `6` | Taille du LV `/var/lib` |
+| `lvm_swap_gb` | `2` | Taille du LV swap (`0` = pas de swap) |
 
 ---
 
-## 5. Initialiser Kubernetes (kubeadm)
+## Outputs
 
-Une fois les VMs démarrées :
-
-```bash
-# Sur le contrôleur
-ssh ubuntu@192.168.1.110
-sudo kubeadm init --pod-network-cidr=10.244.0.0/16
-
-# Copier la config kubectl
-mkdir -p $HOME/.kube
-sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
-
-# Installer un CNI (ex: Flannel)
-kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
-
-# Sur chaque worker (avec le token affiché par kubeadm init)
-sudo kubeadm join 192.168.1.110:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
-```
+| Output | Description |
+|---|---|
+| `vm_id` | VMID Proxmox de la VM créée |
+| `vm_name` | Nom de la VM |
+| `ip_address` | IP configurée via cloud-init |
+| `ipv4_addresses` | IPs remontées par l'agent QEMU (après démarrage) |
 
 ---
 
-## Dimensionnement homelab (i7-4790K / 32 GiB / 2.75 To)
-
-| Profil | Ctrl | Workers | RAM totale VMs | vCPU total |
-|---|---|---|---|---|
-| **Standalone (défaut)** | 1×(2c/4G/30G) | 2×(2c/6G/50G) | 16 GiB | 6 vCPU |
-| **HA etcd** | 3×(2c/4G/30G) | 2×(2c/6G/50G) | 24 GiB | 10 vCPU |
-
-> Proxmox lui-même consomme ~2-4 GiB de RAM. Le profil standalone laisse ~12-14 GiB libres
-> pour l'overcommit ou des VMs supplémentaires.
-
----
-
-## Détruire l'infrastructure
+## Détruire
 
 ```bash
 terraform destroy
